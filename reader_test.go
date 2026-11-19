@@ -1246,6 +1246,139 @@ func TestOffsetStash(t *testing.T) {
 	}
 }
 
+func TestReaderRebalanceBoundaryAbandonsPrefetchedBatch(t *testing.T) {
+	const (
+		topic      = "rebalance-topic"
+		partitions = 20
+	)
+
+	newReader := func() *Reader {
+		return &Reader{
+			config: ReaderConfig{
+				GroupID: "rebalance-group",
+				Topic:   topic,
+			},
+			msgs:        make(chan readerMessage, 2*partitions),
+			cancel:      func() {},
+			commits:     make(chan commitRequest, partitions),
+			stctx:       context.Background(),
+			version:     1,
+			stats:       &readerStats{},
+			assignments: make(map[topicPartition]struct{}, partitions),
+		}
+	}
+
+	t.Run("prefetched batch is abandoned before the next generation", func(t *testing.T) {
+		r := newReader()
+
+		for partition := 0; partition < partitions; partition++ {
+			key := topicPartition{topic: topic, partition: int32(partition)}
+			r.assignments[key] = struct{}{}
+			r.msgs <- readerMessage{
+				version: 1,
+				message: Message{
+					Topic:     topic,
+					Partition: partition,
+					Offset:    0,
+				},
+				watermark: 1,
+			}
+		}
+
+		require.Len(t, r.msgs, partitions)
+
+		r.unsubscribe()
+
+		require.Empty(t, r.msgs)
+		require.Nil(t, r.assignments)
+		require.Equal(t, int64(2), r.version)
+
+		// The next owner reads the same batch from the last committed offset.
+		r.version++
+		r.assignments = make(map[topicPartition]struct{}, partitions)
+		for partition := 0; partition < partitions; partition++ {
+			key := topicPartition{topic: topic, partition: int32(partition)}
+			r.assignments[key] = struct{}{}
+			r.msgs <- readerMessage{
+				version: 3,
+				message: Message{
+					Topic:     topic,
+					Partition: partition,
+					Offset:    0,
+				},
+				watermark: 1,
+			}
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+
+		seen := make(map[topicPartition]map[int64]int, partitions)
+		for i := 0; i < partitions; i++ {
+			msg, err := r.FetchMessage(ctx)
+			require.NoError(t, err)
+
+			key := topicPartition{topic: msg.Topic, partition: int32(msg.Partition)}
+			if seen[key] == nil {
+				seen[key] = make(map[int64]int)
+			}
+			seen[key][msg.Offset]++
+		}
+
+		duplicates := 0
+		for _, offsets := range seen {
+			for _, count := range offsets {
+				if count > 1 {
+					duplicates += count - 1
+				}
+			}
+		}
+		require.Zero(t, duplicates)
+	})
+
+	t.Run("stale generation and revoked partitions are discarded", func(t *testing.T) {
+		r := newReader()
+		r.version = 3
+		for partition := 10; partition < partitions; partition++ {
+			key := topicPartition{topic: topic, partition: int32(partition)}
+			r.assignments[key] = struct{}{}
+		}
+
+		// Messages left over from the previous generation.
+		for partition := 0; partition < partitions; partition++ {
+			r.msgs <- readerMessage{
+				version: 2,
+				message: Message{Topic: topic, Partition: partition, Offset: 7},
+			}
+		}
+
+		// A message from the current generation, but a partition that is no
+		// longer assigned to this reader.
+		r.msgs <- readerMessage{
+			version: 3,
+			message: Message{Topic: topic, Partition: 0, Offset: 8},
+		}
+
+		// Fresh messages from the current generation and its assignments.
+		for partition := 10; partition < partitions; partition++ {
+			r.msgs <- readerMessage{
+				version: 3,
+				message: Message{Topic: topic, Partition: partition, Offset: 8},
+			}
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+
+		for partition := 10; partition < partitions; partition++ {
+			msg, err := r.FetchMessage(ctx)
+			require.NoError(t, err)
+			require.Equal(t, partition, msg.Partition)
+			require.Equal(t, int64(8), msg.Offset)
+		}
+	})
+}
+
 func TestValidateReader(t *testing.T) {
 	tests := []struct {
 		config       ReaderConfig
