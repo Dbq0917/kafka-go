@@ -55,7 +55,7 @@ func testBatchQueuePutWakesSleepingGetter(t *testing.T) {
 		batch = bq.Get()
 	}()
 	<-ready
-	bq.Put(newWriteBatch(time.Now(), time.Hour*100))
+	bq.Put(newWriteBatch(time.Now(), time.Hour*100, time.Hour*100, nil))
 	wg.Wait()
 	if batch == nil {
 		t.Fatal("got nil batch")
@@ -65,7 +65,7 @@ func testBatchQueuePutWakesSleepingGetter(t *testing.T) {
 func testBatchQueuePutAfterCloseFails(t *testing.T) {
 	bq := newBatchQueue(10)
 	bq.Close()
-	if put := bq.Put(newWriteBatch(time.Now(), time.Hour*100)); put {
+	if put := bq.Put(newWriteBatch(time.Now(), time.Hour*100, time.Hour*100, nil)); put {
 		t.Fatal("put batch into closed queue")
 	}
 }
@@ -73,8 +73,8 @@ func testBatchQueuePutAfterCloseFails(t *testing.T) {
 func testBatchQueueGetWorksAfterClose(t *testing.T) {
 	bq := newBatchQueue(10)
 	enqueueBatches := []*writeBatch{
-		newWriteBatch(time.Now(), time.Hour*100),
-		newWriteBatch(time.Now(), time.Hour*100),
+		newWriteBatch(time.Now(), time.Hour*100, time.Hour*100, nil),
+		newWriteBatch(time.Now(), time.Hour*100, time.Hour*100, nil),
 	}
 
 	for _, batch := range enqueueBatches {
@@ -978,6 +978,14 @@ func testWriterDefaultStats(t *testing.T) {
 		t.Error("Incorrect default BatchTimeout value")
 	}
 
+	if stats.LingerTime == 0 {
+		t.Error("Incorrect default LingerTime value")
+	}
+
+	if stats.MaxBatchTimeout == 0 {
+		t.Error("Incorrect default MaxBatchTimeout value")
+	}
+
 	if stats.ReadTimeout == 0 {
 		t.Error("Incorrect default ReadTimeout value")
 	}
@@ -994,6 +1002,8 @@ func testWriterOverrideConfigStats(t *testing.T) {
 		WriteBackoffMax: 4,
 		BatchSize:       1024,
 		BatchTimeout:    16,
+		LingerTime:      4,
+		MaxBatchTimeout: 8,
 		ReadTimeout:     24,
 		WriteTimeout:    32,
 	}
@@ -1019,6 +1029,14 @@ func testWriterOverrideConfigStats(t *testing.T) {
 
 	if stats.BatchTimeout != 16 {
 		t.Error("Incorrect BatchTimeout value")
+	}
+
+	if stats.LingerTime != 4 {
+		t.Error("Incorrect LingerTime value")
+	}
+
+	if stats.MaxBatchTimeout != 8 {
+		t.Error("Incorrect MaxBatchTimeout value")
 	}
 
 	if stats.ReadTimeout != 24 {

@@ -598,6 +598,28 @@ w := kafka.NewWriter(kafka.WriterConfig{
 ```
 Note that `kafka.NewWriter` and `kafka.WriterConfig` are deprecated and will be removed in a future release.
 
+### Batching
+
+The writer aggregates messages per topic-partition and flushes a batch as soon
+as one of its thresholds is reached (whichever comes first):
+
+- `BatchSize` / `BatchBytes`: the batch is sent once it reaches the configured
+  number of messages or total byte size.
+- `LingerTime`: a short delay started when the first message enters an empty
+  batch. While messages keep arriving before the delay elapses, the linger
+  timer is extended, allowing busy partitions to build large batches. An
+  isolated message is still flushed after this short delay, so low-traffic
+  partitions do not wait for the full batch timeout. Defaults to `20ms`.
+- `MaxBatchTimeout`: a hard upper bound on the lifetime of an open batch,
+  independent of linger extensions. It guarantees that a trickle of messages
+  cannot keep a batch open indefinitely. Defaults to `BatchTimeout`.
+
+Timer management runs on goroutines owned by the `time` package; the goroutine
+calling `WriteMessages` never blocks on batching logic. The historical
+`BatchTimeout` field keeps working: setting `LingerTime >= BatchTimeout`
+restores the previous behavior where incomplete batches are held until the
+batch timeout fires.
+
 ## SASL Support
 
 You can specify an option on the `Dialer` to use SASL authentication. The `Dialer` can be used directly to open a `Conn` or it can be passed to a `Reader` or `Writer` via their respective configs. If the `SASLMechanism` field is `nil`, it will not authenticate with SASL.

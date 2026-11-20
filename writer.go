@@ -130,6 +130,31 @@ type Writer struct {
 	// The default is to flush at least every second.
 	BatchTimeout time.Duration
 
+	// LingerTime is the delay before flushing an open message batch that has
+	// not yet reached BatchSize or BatchBytes. It acts as a short aggregation
+	// window started when the first message is added to an empty batch: the
+	// batch is sent as soon as either the linger delay elapses or the batch
+	// size/byte limits are reached, whichever comes first.
+	//
+	// LingerTime is expected to be smaller than (or equal to) BatchTimeout,
+	// which caps the maximum amount of time a batch can remain open. If the
+	// linger timer fires while messages keep arriving, the batch is flushed
+	// immediately rather than being held until BatchTimeout, so low-traffic
+	// partitions do not pay the full BatchTimeout in latency.
+	//
+	// The default is 20ms. Setting LingerTime >= BatchTimeout restores the
+	// historical behavior where batches are held until BatchTimeout.
+	LingerTime time.Duration
+
+	// MaxBatchTimeout is an upper bound on the amount of time an open message
+	// batch can be retained before being flushed regardless of how many
+	// messages it contains. It is intended to protect latency when messages
+	// keep trickling in and keep extending the LingerTime aggregation window.
+	//
+	// The default is to use the value of BatchTimeout. A value lower than
+	// LingerTime is ignored (LingerTime takes precedence as the first timer).
+	MaxBatchTimeout time.Duration
+
 	// Timeout for read operations performed by the Writer.
 	//
 	// Defaults to 10 seconds.
@@ -282,6 +307,19 @@ type WriterConfig struct {
 	// The default is to flush at least every second.
 	BatchTimeout time.Duration
 
+	// LingerTime is the delay before flushing an open batch that has not yet
+	// reached BatchSize or BatchBytes. See Writer.LingerTime for the full
+	// semantics.
+	//
+	// The default is 20ms.
+	LingerTime time.Duration
+
+	// MaxBatchTimeout caps how long an open batch can be retained while
+	// messages keep extending the linger window. See Writer.MaxBatchTimeout.
+	//
+	// The default is to use BatchTimeout.
+	MaxBatchTimeout time.Duration
+
 	// Timeout for read operations performed by the Writer.
 	//
 	// Defaults to 10 seconds.
@@ -361,6 +399,8 @@ type WriterStats struct {
 	WriteBackoffMax time.Duration `metric:"kafka.writer.backoff.max"   type:"gauge"`
 	MaxBatchSize    int64         `metric:"kafka.writer.batch.max"     type:"gauge"`
 	BatchTimeout    time.Duration `metric:"kafka.writer.batch.timeout" type:"gauge"`
+	LingerTime      time.Duration `metric:"kafka.writer.batch.linger"  type:"gauge"`
+	MaxBatchTimeout time.Duration `metric:"kafka.writer.batch.max_timeout" type:"gauge"`
 	ReadTimeout     time.Duration `metric:"kafka.writer.read.timeout"  type:"gauge"`
 	WriteTimeout    time.Duration `metric:"kafka.writer.write.timeout" type:"gauge"`
 	RequiredAcks    int64         `metric:"kafka.writer.acks.required" type:"gauge"`
@@ -487,22 +527,24 @@ func NewWriter(config WriterConfig) *Writer {
 	}
 
 	w := &Writer{
-		Addr:         TCP(config.Brokers...),
-		Topic:        config.Topic,
-		MaxAttempts:  config.MaxAttempts,
-		BatchSize:    config.BatchSize,
-		Balancer:     config.Balancer,
-		BatchBytes:   int64(config.BatchBytes),
-		BatchTimeout: config.BatchTimeout,
-		ReadTimeout:  config.ReadTimeout,
-		WriteTimeout: config.WriteTimeout,
-		RequiredAcks: RequiredAcks(config.RequiredAcks),
-		Async:        config.Async,
-		Logger:       config.Logger,
-		ErrorLogger:  config.ErrorLogger,
-		Transport:    transport,
-		transport:    transport,
-		writerStats:  stats,
+		Addr:            TCP(config.Brokers...),
+		Topic:           config.Topic,
+		MaxAttempts:     config.MaxAttempts,
+		BatchSize:       config.BatchSize,
+		Balancer:        config.Balancer,
+		BatchBytes:      int64(config.BatchBytes),
+		BatchTimeout:    config.BatchTimeout,
+		LingerTime:      config.LingerTime,
+		MaxBatchTimeout: config.MaxBatchTimeout,
+		ReadTimeout:     config.ReadTimeout,
+		WriteTimeout:    config.WriteTimeout,
+		RequiredAcks:    RequiredAcks(config.RequiredAcks),
+		Async:           config.Async,
+		Logger:          config.Logger,
+		ErrorLogger:     config.ErrorLogger,
+		Transport:       transport,
+		transport:       transport,
+		writerStats:     stats,
 	}
 
 	if config.RequiredAcks == 0 {
@@ -588,8 +630,11 @@ func (w *Writer) Close() error {
 //
 // When sending synchronously and the writer's batch size is configured to be
 // greater than 1, this method blocks until either a full batch can be assembled
-// or the batch timeout is reached.  The batch size and timeouts are evaluated
-// per partition, so the choice of Balancer can also influence the flushing
+// or a time threshold is reached. A batch is flushed as soon as BatchSize or
+// BatchBytes is reached, or when LingerTime elapses after its most recent
+// message; MaxBatchTimeout caps the total lifetime of a batch that keeps
+// receiving messages. The batch size and timeouts are evaluated per
+// partition, so the choice of Balancer can also influence the flushing
 // behavior.  For example, the Hash balancer will require on average N * batch
 // size messages to trigger a flush where N is the number of partitions.  The
 // best way to achieve good batching behavior is to share one Writer amongst
@@ -829,6 +874,28 @@ func (w *Writer) batchTimeout() time.Duration {
 	return 1 * time.Second
 }
 
+func (w *Writer) lingerTime() time.Duration {
+	if w.LingerTime > 0 {
+		return w.LingerTime
+	}
+	return 20 * time.Millisecond
+}
+
+// maxBatchTimeout returns the hard upper bound on how long an open batch can
+// be retained. It is clamped down to the linger delay so the first timer that
+// fires is always LingerTime; callers schedule a separate linger timer which
+// may be extended while messages keep arriving.
+func (w *Writer) maxBatchTimeout() time.Duration {
+	timeout := w.MaxBatchTimeout
+	if timeout <= 0 {
+		timeout = w.batchTimeout()
+	}
+	if linger := w.lingerTime(); timeout < linger {
+		timeout = linger
+	}
+	return timeout
+}
+
 func (w *Writer) readTimeout() time.Duration {
 	if w.ReadTimeout > 0 {
 		return w.ReadTimeout
@@ -896,6 +963,8 @@ func (w *Writer) Stats() WriterStats {
 		WriteBackoffMax: w.writeBackoffMax(),
 		MaxBatchSize:    int64(w.batchSize()),
 		BatchTimeout:    w.batchTimeout(),
+		LingerTime:      w.lingerTime(),
+		MaxBatchTimeout: w.maxBatchTimeout(),
 		ReadTimeout:     w.readTimeout(),
 		WriteTimeout:    w.writeTimeout(),
 		RequiredAcks:    int64(w.RequiredAcks),
@@ -1029,6 +1098,7 @@ func (ptw *partitionWriter) writeMessages(msgs []Message, indexes []int32) map[*
 
 	batchSize := ptw.w.batchSize()
 	batchBytes := ptw.w.batchBytes()
+	linger := ptw.w.lingerTime()
 
 	var batches map[*writeBatch][]int32
 	if !ptw.w.Async {
@@ -1042,17 +1112,21 @@ func (ptw *partitionWriter) writeMessages(msgs []Message, indexes []int32) map[*
 			batch = ptw.newWriteBatch()
 			ptw.currBatch = batch
 		}
+		hadMessages := batch.size > 0
 		if !batch.add(msgs[i], batchSize, batchBytes) {
-			batch.trigger()
-			ptw.queue.Put(batch)
-			ptw.currBatch = nil
+			ptw.enqueueCurrent(batch)
 			goto assignMessage
 		}
 
 		if batch.full(batchSize, batchBytes) {
-			batch.trigger()
-			ptw.queue.Put(batch)
-			ptw.currBatch = nil
+			ptw.enqueueCurrent(batch)
+		} else if hadMessages {
+			// The batch was already open and the linger timer started when its
+			// first message was added. Each subsequent message extends the
+			// aggregation window so a steady stream of messages can build a
+			// large batch, while a single isolated message is still flushed
+			// after the linger delay instead of waiting for BatchTimeout.
+			batch.extendLinger(linger)
 		}
 
 		if !ptw.w.Async {
@@ -1064,38 +1138,40 @@ func (ptw *partitionWriter) writeMessages(msgs []Message, indexes []int32) map[*
 
 // ptw.w can be accessed here because this is called with the lock ptw.mutex already held.
 func (ptw *partitionWriter) newWriteBatch() *writeBatch {
-	batch := newWriteBatch(time.Now(), ptw.w.batchTimeout())
-	ptw.w.spawn(func() { ptw.awaitBatch(batch) })
+	batch := newWriteBatch(
+		time.Now(),
+		ptw.w.lingerTime(),
+		ptw.w.maxBatchTimeout(),
+		ptw.flushIfCurrent,
+	)
 	return batch
 }
 
-// awaitBatch waits for a batch to either fill up or time out.
-// If the batch is full it only stops the timer, if the timer
-// expires it will queue the batch for writing if needed.
-func (ptw *partitionWriter) awaitBatch(batch *writeBatch) {
-	select {
-	case <-batch.timer.C:
-		ptw.mutex.Lock()
-		// detach the batch from the writer if we're still attached
-		// and queue for writing.
-		// Only the current batch can expire, all previous batches were already written to the queue.
-		// If writeMesseages locks pw.mutex after the timer fires but before this goroutine
-		// can lock pw.mutex it will either have filled the batch and enqueued it which will mean
-		// pw.currBatch != batch so we just move on.
-		// Otherwise, we detach the batch from the ptWriter and enqueue it for writing.
-		if ptw.currBatch == batch {
-			ptw.queue.Put(batch)
-			ptw.currBatch = nil
-		}
-		ptw.mutex.Unlock()
-	case <-batch.ready:
-		// The batch became full, it was removed from the ptwriter and its
-		// ready channel was closed. We need to close the timer to avoid
-		// having it leak until it expires.
-		batch.timer.Stop()
+// enqueueCurrent detaches batch from the partition writer, stops its timers
+// and queues it for delivery. It must be called with ptw.mutex held.
+func (ptw *partitionWriter) enqueueCurrent(batch *writeBatch) {
+	if ptw.currBatch != batch {
+		return
 	}
-	stats := ptw.w.stats()
-	stats.batchQueueTime.observe(int64(time.Since(batch.time)))
+	batch.stopTimers()
+	batch.trigger()
+	ptw.queue.Put(batch)
+	ptw.currBatch = nil
+	ptw.w.stats().batchQueueTime.observe(int64(time.Since(batch.time)))
+}
+
+// flushIfCurrent is invoked by the batch linger/deadline timers. Timer
+// callbacks run on goroutines owned by the time package, not by the sending
+// thread, so WriteMessages never blocks on batch timing logic. If the batch
+// already filled up and was queued by writeMessages it is no longer the
+// current batch and the callback is a no-op.
+func (ptw *partitionWriter) flushIfCurrent(batch *writeBatch) {
+	ptw.mutex.Lock()
+	defer ptw.mutex.Unlock()
+
+	if ptw.currBatch == batch {
+		ptw.enqueueCurrent(batch)
+	}
 }
 
 func (ptw *partitionWriter) writeBatch(batch *writeBatch) {
@@ -1189,10 +1265,7 @@ func (ptw *partitionWriter) close() {
 	defer ptw.mutex.Unlock()
 
 	if ptw.currBatch != nil {
-		batch := ptw.currBatch
-		ptw.queue.Put(batch)
-		ptw.currBatch = nil
-		batch.trigger()
+		ptw.enqueueCurrent(ptw.currBatch)
 	}
 
 	ptw.queue.Close()
@@ -1205,17 +1278,38 @@ type writeBatch struct {
 	bytes int64
 	ready chan struct{}
 	done  chan struct{}
-	timer *time.Timer
 	err   error // result of the batch completion
+
+	// linger fires shortly after the most recent message was added to the
+	// batch. While messages keep arriving before the linger delay elapses the
+	// timer is extended, so low-rate traffic is flushed promptly without
+	// waiting for the full batch timeout.
+	linger *time.Timer
+
+	// deadline is a hard upper bound on the lifetime of the batch. It is never
+	// extended, ensuring that a trickle of messages cannot keep the batch open
+	// indefinitely.
+	deadline *time.Timer
 }
 
-func newWriteBatch(now time.Time, timeout time.Duration) *writeBatch {
-	return &writeBatch{
+func newWriteBatch(now time.Time, linger time.Duration, maxLifetime time.Duration, onTimeout func(*writeBatch)) *writeBatch {
+	batch := &writeBatch{
 		time:  now,
 		ready: make(chan struct{}),
 		done:  make(chan struct{}),
-		timer: time.NewTimer(timeout),
 	}
+	// time.AfterFunc runs the callback in its own goroutine without ever
+	// blocking the goroutine that adds messages to the batch: the sending
+	// thread only performs non-blocking timer resets while holding the
+	// partition writer lock.
+	callback := func() {
+		if onTimeout != nil {
+			onTimeout(batch)
+		}
+	}
+	batch.linger = time.AfterFunc(linger, callback)
+	batch.deadline = time.AfterFunc(maxLifetime, callback)
+	return batch
 }
 
 func (b *writeBatch) add(msg Message, maxSize int, maxBytes int64) bool {
@@ -1235,8 +1329,24 @@ func (b *writeBatch) add(msg Message, maxSize int, maxBytes int64) bool {
 	return true
 }
 
+// extendLinger pushes the linger timer back by d. The deadline timer is left
+// untouched. This is called with the partition writer mutex held, so it never
+// races with flushIfCurrent.
+func (b *writeBatch) extendLinger(d time.Duration) {
+	b.linger.Reset(d)
+}
+
 func (b *writeBatch) full(maxSize int, maxBytes int64) bool {
 	return b.size >= maxSize || b.bytes >= maxBytes
+}
+
+// stopTimers releases the batch timers. It is safe to call once the batch has
+// been detached from its partition writer (either because it was full or
+// because a timer fired); any callback that already started becomes a no-op
+// because the partition writer no longer references the batch.
+func (b *writeBatch) stopTimers() {
+	b.linger.Stop()
+	b.deadline.Stop()
 }
 
 func (b *writeBatch) trigger() {
