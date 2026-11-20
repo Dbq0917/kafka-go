@@ -1318,6 +1318,275 @@ func TestCommitLoopImmediateFlushOnGenerationEnd(t *testing.T) {
 	}
 }
 
+// newThrottledCommitTestReader builds the minimal Reader state exercised by
+// the ReadMessageBatch commit pipeline tests. It runs the synchronous commit
+// loop against a mock coordinator, so every flushed stash produces exactly one
+// OffsetCommit request without needing a live broker.
+func newThrottledCommitTestReader(t *testing.T, commitInterval time.Duration, onCommit func(offsetCommitRequestV2)) (*Reader, *Generation) {
+	t.Helper()
+
+	gen := &Generation{
+		conn: mockCoordinator{
+			offsetCommitFunc: func(req offsetCommitRequestV2) (offsetCommitResponseV2, error) {
+				onCommit(req)
+				return offsetCommitResponseV2{}, nil
+			},
+		},
+		done:     make(chan struct{}),
+		log:      func(func(Logger)) {},
+		logError: func(func(Logger)) {},
+		joined:   make(chan struct{}),
+	}
+
+	r := &Reader{
+		config: ReaderConfig{
+			GroupID:        "test-group",
+			CommitInterval: 0,
+		},
+		stctx:               context.Background(),
+		msgs:                make(chan readerMessage, 1024),
+		commits:             make(chan commitRequest, 100),
+		pendingCommits:      offsetStash{},
+		highestCommits:      offsetStash{},
+		batchCommitInterval: commitInterval,
+		// closed keeps FetchMessage from calling the uninitialized start()
+		// path; with version 0 every readerMessage on r.msgs is accepted.
+		closed:  true,
+		version: 0,
+	}
+
+	gen.Start(func(ctx context.Context) {
+		r.commitLoopImmediate(ctx, gen)
+	})
+
+	t.Cleanup(func() { gen.close() })
+
+	return r, gen
+}
+
+func batchMsg(offset int64) Message {
+	return Message{Topic: "topic", Partition: 0, Offset: offset}
+}
+
+// TestReadMessageBatchThrottlesCommits verifies that processing many batches
+// in quick succession does not produce a commit per batch: offsets are
+// coalesced and flushed at most once per batchCommitInterval, with the final
+// offset still reaching the coordinator.
+func TestReadMessageBatchThrottlesCommits(t *testing.T) {
+	t.Parallel()
+
+	var (
+		mu          sync.Mutex
+		commitCount int
+		maxOffset   int64
+	)
+	r, _ := newThrottledCommitTestReader(t, time.Second, func(req offsetCommitRequestV2) {
+		mu.Lock()
+		defer mu.Unlock()
+		commitCount++
+		if off := req.Topics[0].Partitions[0].Offset; off > maxOffset {
+			maxOffset = off
+		}
+	})
+
+	ctx := context.Background()
+
+	// Simulate 500 messages consumed in batches of 50: ten successful batches
+	// fired back to back must collapse into a single throttled commit.
+	for first := int64(0); first < 500; first += 50 {
+		err := r.enqueueBatchCommit(ctx, batchMsg(first+49))
+		if err != nil {
+			t.Fatalf("enqueue batch ending at %d: %v", first+49, err)
+		}
+	}
+
+	if err := r.flushPendingBatchCommit(ctx); err != nil {
+		t.Fatalf("flush pending commits: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if commitCount > 2 {
+		t.Fatalf("expected at most 2 OffsetCommit requests (1 throttled + 1 flush), got %d", commitCount)
+	}
+	if maxOffset != 500 {
+		t.Fatalf("expected final committed offset 500, got %d", maxOffset)
+	}
+}
+
+// TestReadMessageBatchFailedBatchIsNotCommitted verifies the core ordering
+// fix: a batch whose handler fails must not be committed, even when later
+// batches succeed, and the failed offsets must be redeliverable from the last
+// committed position.
+func TestReadMessageBatchFailedBatchIsNotCommitted(t *testing.T) {
+	t.Parallel()
+
+	var (
+		mu          sync.Mutex
+		committed   []int64
+		commitCount int
+	)
+	r, _ := newThrottledCommitTestReader(t, time.Hour, func(req offsetCommitRequestV2) {
+		mu.Lock()
+		defer mu.Unlock()
+		commitCount++
+		committed = append(committed, req.Topics[0].Partitions[0].Offset)
+	})
+
+	// Feed a 500-message batch through the same message channel FetchMessage
+	// reads from. version 0 messages are always accepted.
+	const batchSize = 500
+	for i := 0; i < batchSize; i++ {
+		r.msgs <- readerMessage{message: batchMsg(int64(i))}
+	}
+
+	ctx := context.Background()
+
+	// First processing attempt fails after the messages were fetched but
+	// before any commit. ReadMessageBatch must return the handler error and
+	// leave the commit offset untouched.
+	handlerErr := errors.New("processing failed")
+	seenFirst := make([]int64, 0, batchSize)
+	err := r.ReadMessageBatch(ctx, batchSize, func(_ context.Context, msgs []Message) error {
+		for _, m := range msgs {
+			seenFirst = append(seenFirst, m.Offset)
+		}
+		return handlerErr
+	})
+	if !errors.Is(err, handlerErr) {
+		t.Fatalf("expected handler error to propagate, got %v", err)
+	}
+
+	if len(seenFirst) != batchSize || seenFirst[0] != 0 || seenFirst[batchSize-1] != batchSize-1 {
+		t.Fatalf("first attempt saw %d messages, expected the full batch 0..%d", len(seenFirst), batchSize-1)
+	}
+
+	// A crash at this point loses nothing: no OffsetCommit was sent for the
+	// failed batch.
+	if err := r.flushPendingBatchCommit(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	mu.Lock()
+	gotCommitCount := commitCount
+	mu.Unlock()
+
+	if gotCommitCount != 0 {
+		t.Fatalf("expected no commits for the failed batch, got %d: %v", gotCommitCount, committed)
+	}
+
+	// Simulate redelivery: the same 500 messages are fetched again after the
+	// consumer restarts from the last committed offset. This time processing
+	// succeeds and the batch is committed exactly once at offset 500.
+	for i := 0; i < batchSize; i++ {
+		r.msgs <- readerMessage{message: batchMsg(int64(i))}
+	}
+
+	seenRetry := make([]int64, 0, batchSize)
+	if err := r.ReadMessageBatch(ctx, batchSize, func(_ context.Context, msgs []Message) error {
+		for _, m := range msgs {
+			seenRetry = append(seenRetry, m.Offset)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("retry processing failed: %v", err)
+	}
+
+	if len(seenRetry) != batchSize || seenRetry[0] != 0 || seenRetry[batchSize-1] != batchSize-1 {
+		t.Fatalf("redelivered batch mismatch: got %d messages %d..%d", len(seenRetry), firstOr(seenRetry), lastOr(seenRetry))
+	}
+
+	if err := r.flushPendingBatchCommit(ctx); err != nil {
+		t.Fatalf("flush after retry: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if commitCount != 1 {
+		t.Fatalf("expected exactly 1 commit after successful retry, got %d: %v", commitCount, committed)
+	}
+	if committed[0] != batchSize {
+		t.Fatalf("expected redelivery commit offset %d, got %d", batchSize, committed[0])
+	}
+}
+
+func firstOr(v []int64) int64 {
+	if len(v) == 0 {
+		return -1
+	}
+	return v[0]
+}
+
+func lastOr(v []int64) int64 {
+	if len(v) == 0 {
+		return -1
+	}
+	return v[len(v)-1]
+}
+
+// TestReadMessageBatchValidatesArguments locks in the preconditions of the
+// safe batch API: a consumer group is required, max must be positive and the
+// handler cannot be nil.
+func TestReadMessageBatchValidatesArguments(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	noop := func(context.Context, []Message) error { return nil }
+
+	groupReader := &Reader{
+		config:              ReaderConfig{GroupID: "g"},
+		batchCommitInterval: defaultBatchCommitInterval,
+	}
+	plainReader := &Reader{config: ReaderConfig{}}
+
+	if err := plainReader.ReadMessageBatch(ctx, 10, noop); !errors.Is(err, errOnlyAvailableWithGroup) {
+		t.Fatalf("expected errOnlyAvailableWithGroup without a group, got %v", err)
+	}
+	if err := groupReader.ReadMessageBatch(ctx, 0, noop); err == nil {
+		t.Fatal("expected error for non-positive max")
+	}
+	if err := groupReader.ReadMessageBatch(ctx, 10, nil); err == nil {
+		t.Fatal("expected error for nil handler")
+	}
+}
+
+// TestReadMessageBatchCommitOffsetsMonotonic verifies that duplicate or
+// out-of-order commits never move a partition offset backwards: only the
+// highest successfully processed offset is committed.
+func TestReadMessageBatchCommitOffsetsMonotonic(t *testing.T) {
+	t.Parallel()
+
+	var committed []int64
+	r, _ := newThrottledCommitTestReader(t, 0, func(req offsetCommitRequestV2) {
+		committed = append(committed, req.Topics[0].Partitions[0].Offset)
+	})
+
+	ctx := context.Background()
+
+	// Process batches out of order / repeatedly, as retries and duplicate
+	// deliveries would cause.
+	for _, off := range []int64{199, 499, 99, 499, 299} {
+		if err := r.enqueueBatchCommit(ctx, batchMsg(off)); err != nil {
+			t.Fatalf("enqueue offset %d: %v", off, err)
+		}
+	}
+
+	// Every reported offset must be strictly monotonic and capped at the
+	// highest successfully processed message (499 -> commit offset 500).
+	var previous int64
+	for i, off := range committed {
+		if off < previous {
+			t.Fatalf("commit %d went backwards: %d after %d", i, off, previous)
+		}
+		previous = off
+	}
+	if previous != 500 {
+		t.Fatalf("expected highest committed offset 500, got %d", previous)
+	}
+}
+
 func TestCommitOffsetsWithRetry(t *testing.T) {
 	offsets := offsetStash{"topic": {0: 0}}
 
@@ -1995,4 +2264,95 @@ func testReaderTopicRecreated(t *testing.T, ctx context.Context, r *Reader) {
 	// expect an error, since the offset should now be out of range
 	_, err = r.ReadMessage(ctx)
 	require.ErrorIs(t, err, OffsetOutOfRange)
+}
+
+// skipIfNoBroker allows the at-least-once integration test to run wherever
+// the docker-compose Kafka cluster is available (CI) and skip cleanly in an
+// environment without a broker.
+func skipIfNoBroker(t *testing.T) {
+	t.Helper()
+	conn, err := Dial("tcp", "localhost:9092")
+	if err != nil {
+		t.Skipf("skipping integration test, no kafka broker on localhost:9092: %v", err)
+	}
+	conn.Close()
+}
+
+// TestReaderConsumerGroupRedeliversFailedBatch drives ReadMessageBatch
+// against a real broker with a 500-message batch. The handler fails on the
+// first delivery; the test then asserts that:
+//
+//   - no offset is committed for the failed batch,
+//   - the very same 500 messages are redelivered from offset 0,
+//   - after successful processing the group offset advances to 500 exactly
+//     once (duplicate/retried commits do not move it further).
+func TestReaderConsumerGroupRedeliversFailedBatch(t *testing.T) {
+	skipIfNoBroker(t)
+
+	const batchSize = 500
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	topic := makeTopic()
+	createTopic(t, topic, 1)
+	defer deleteTopic(t, topic)
+
+	groupID := makeGroupID()
+	reader := NewReader(ReaderConfig{
+		Brokers:          []string{"localhost:9092"},
+		Topic:            topic,
+		GroupID:          groupID,
+		MinBytes:         1,
+		MaxBytes:         10e6,
+		MaxWait:          100 * time.Millisecond,
+		RebalanceTimeout: 5 * time.Second,
+	})
+	defer reader.Close()
+
+	prepareReader(t, ctx, reader, makeTestSequence(batchSize)...)
+
+	// First processing attempt fails after fetching the whole batch.
+	firstBatch := make([]int64, 0, batchSize)
+	processErr := errors.New("simulated processing failure")
+	err := reader.ReadMessageBatch(ctx, batchSize, func(_ context.Context, msgs []Message) error {
+		for _, m := range msgs {
+			firstBatch = append(firstBatch, m.Offset)
+		}
+		return processErr
+	})
+	require.ErrorIs(t, err, processErr)
+	require.Len(t, firstBatch, batchSize)
+	require.Equal(t, int64(0), firstBatch[0])
+	require.Equal(t, int64(batchSize-1), firstBatch[batchSize-1])
+
+	// A brand new reader joining the same group must resume from offset 0
+	// because the failed batch was never committed.
+	restarted := NewReader(reader.config)
+	defer restarted.Close()
+
+	redelivered := make([]int64, 0, batchSize)
+	require.NoError(t, restarted.ReadMessageBatch(ctx, batchSize, func(_ context.Context, msgs []Message) error {
+		for _, m := range msgs {
+			redelivered = append(redelivered, m.Offset)
+		}
+		return nil
+	}))
+
+	require.Equal(t, firstBatch, redelivered, "the failed batch must be redelivered unchanged")
+
+	// Close flushes the throttled pending commit; the group offset must end up
+	// at 500 and stay there even if the same batch is committed again.
+	require.NoError(t, restarted.Close())
+
+	offsets := getOffsets(t, restarted.config)
+	require.Equal(t, map[int]int64{0: int64(batchSize)}, offsets)
+
+	// Re-committing the last processed message must not advance the offset
+	// past 500.
+	again := NewReader(reader.config)
+	defer again.Close()
+	require.NoError(t, again.CommitMessages(ctx, Message{Topic: topic, Partition: 0, Offset: batchSize - 1}))
+	require.NoError(t, again.Close())
+	require.Equal(t, map[int]int64{0: int64(batchSize)}, getOffsets(t, again.config))
 }

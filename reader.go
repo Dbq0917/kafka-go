@@ -22,6 +22,17 @@ const (
 	// defaultCommitRetries holds the number of commit attempts to make
 	// before giving up.
 	defaultCommitRetries = 3
+
+	// defaultBatchCommitInterval bounds how often ReadMessageBatch issues
+	// offset commits. Committing once per processed batch would make the
+	// commit rate scale with the message rate, which can overwhelm the
+	// coordinator and reduce throughput; successful batches are instead
+	// coalesced and flushed at most this often (and once on Close).
+	defaultBatchCommitInterval = time.Second
+
+	// closeBatchCommitTimeout bounds how long Close waits for the final
+	// flush of coalesced batch offsets before tearing down the commit loop.
+	closeBatchCommitTimeout = 5 * time.Second
 )
 
 const (
@@ -74,6 +85,18 @@ type Reader struct {
 	offset  int64
 	lag     int64
 	closed  bool
+
+	// batchCommitMu guards the pending offsets accumulated by
+	// ReadMessageBatch. Successfully processed batches are merged into
+	// pendingCommits and flushed at most once per defaultBatchCommitInterval,
+	// so the commit rate does not scale with the batch processing rate. A
+	// batch whose handler failed is never merged in, therefore its offsets
+	// cannot be advanced by later, duplicate commit requests either.
+	batchCommitMu       sync.Mutex
+	pendingCommits      offsetStash
+	lastBatchCommitAt   time.Time
+	highestCommits      offsetStash
+	batchCommitInterval time.Duration
 
 	// Without a group subscription (when Reader.config.GroupID == ""),
 	// when errors occur, the Reader gets a synthetic readerMessage with
@@ -716,7 +739,8 @@ func NewReader(config ReaderConfig) *Reader {
 			// once when the reader is created.
 			partition: strconv.Itoa(readerStatsPartition),
 		},
-		version: version,
+		version:             version,
+		batchCommitInterval: defaultBatchCommitInterval,
 	}
 	if r.useConsumerGroup() {
 		r.done = make(chan struct{})
@@ -761,6 +785,18 @@ func (r *Reader) Close() error {
 	closed := r.closed
 	r.closed = true
 	r.mutex.Unlock()
+
+	// Flush offsets of batches that were processed successfully since the
+	// last throttled commit, before the commit loop is torn down. Failed
+	// batches were never enqueued, so their messages stay uncommitted and
+	// will be redelivered to the next consumer.
+	if !closed && r.useConsumerGroup() {
+		flushCtx, cancel := context.WithTimeout(context.Background(), closeBatchCommitTimeout)
+		if err := r.flushPendingBatchCommit(flushCtx); err != nil {
+			r.withErrorLogger(func(l Logger) { l.Printf("flushing batch offsets on close: %v", err) })
+		}
+		cancel()
+	}
 
 	r.cancel()
 	r.stop()
@@ -897,6 +933,185 @@ func (r *Reader) CommitMessages(ctx context.Context, msgs ...Message) error {
 	case <-r.stctx.Done():
 		// This context is used to ensure we don't allow commits after the
 		// reader was closed.
+		return io.ErrClosedPipe
+	}
+
+	if !r.useSyncCommits() {
+		return nil
+	}
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-errch:
+		return err
+	}
+}
+
+// BatchHandler processes a batch of messages fetched by ReadMessageBatch.
+//
+// The offset of a batch is only committed when the handler returns nil. If
+// the handler returns an error, nothing is committed and the messages of the
+// failed batch are fetched again on the next call, so handlers must be
+// idempotent and expect to see the same messages again after a failure or a
+// crash. This gives at-least-once delivery: messages are never acknowledged
+// to the broker before they have been processed successfully.
+type BatchHandler func(ctx context.Context, messages []Message) error
+
+// ReadMessageBatch fetches a batch of up to max messages, runs handler on it,
+// and commits the offsets only after the handler succeeds.
+//
+// Unlike ReadMessage, which auto-commits a message as soon as it is returned
+// and therefore can acknowledge messages that were never processed, this
+// method establishes a strict ordering: fetch -> process -> commit. A batch
+// whose handler fails is not committed, so after a process restart (or simply
+// on the next loop iteration) the whole batch is redelivered from the last
+// committed offset.
+//
+// Commits are asynchronous and coalesced. To keep the commit frequency from
+// growing with the batch rate, offsets of successfully processed batches are
+// flushed at most once per second (and once more when the Reader is closed),
+// instead of issuing a commit for every batch. Re-committing an offset that
+// has already been superseded never moves the partition offset backwards, and
+// failed batches are never committed at all.
+//
+// max must be greater than zero. ReadMessageBatch requires a consumer group
+// (GroupID must be set), otherwise it returns errOnlyAvailableWithGroup.
+func (r *Reader) ReadMessageBatch(ctx context.Context, max int, handler BatchHandler) error {
+	if !r.useConsumerGroup() {
+		return errOnlyAvailableWithGroup
+	}
+	if max <= 0 {
+		return errors.New("ReadMessageBatch requires a positive max number of messages")
+	}
+	if handler == nil {
+		return errors.New("ReadMessageBatch requires a non-nil handler")
+	}
+
+	batch := make([]Message, 0, max)
+
+	// Stop fetching the moment the batch is full or the context expires so a
+	// slow topic never blocks the handler past its deadline.
+	fetchCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	for len(batch) < max {
+		m, err := r.FetchMessage(fetchCtx)
+		if err != nil {
+			// A short read on a slow topic is fine: process what we got. Any
+			// other error means the batch is incomplete and must not be
+			// committed.
+			if len(batch) > 0 && errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+				break
+			}
+			return err
+		}
+		batch = append(batch, m)
+	}
+
+	// Process before commit. A handler failure skips the commit entirely, so
+	// the broker still points at the start of this batch and the messages are
+	// redelivered after a restart or on the next read loop.
+	if err := handler(ctx, batch); err != nil {
+		return err
+	}
+
+	// Commit only after the handler succeeded. The request is coalesced with
+	// other in-flight batches and rate limited, so high batch rates do not
+	// translate into equally high commit rates.
+	return r.enqueueBatchCommit(ctx, batch[len(batch)-1])
+}
+
+// enqueueBatchCommit records the offset of a successfully processed batch and
+// flushes the accumulated offsets at most once per
+// defaultBatchCommitInterval. Offsets are merged with a highest-wins rule, so
+// a duplicate or out-of-order request can never move a committed offset
+// backwards or past the latest successfully processed message.
+func (r *Reader) enqueueBatchCommit(ctx context.Context, last Message) error {
+	r.batchCommitMu.Lock()
+	if r.highestCommits == nil {
+		r.highestCommits = offsetStash{}
+	}
+	// Monotonic guard: Kafka only stores one offset per partition, so a
+	// duplicate or retried commit must never move a committed offset
+	// backwards. Drop any request that does not advance past the highest
+	// offset already accepted for its topic/partition.
+	incoming := makeCommits(last)
+	filtered := incoming[:0]
+	for _, c := range incoming {
+		highest, ok := r.highestCommits[c.topic][c.partition]
+		if ok && c.offset <= highest {
+			continue
+		}
+		filtered = append(filtered, c)
+	}
+	if len(filtered) == 0 {
+		r.batchCommitMu.Unlock()
+		return nil
+	}
+	r.highestCommits.merge(filtered)
+	r.pendingCommits.merge(filtered)
+	now := time.Now()
+	due := now.Sub(r.lastBatchCommitAt) >= r.batchCommitInterval
+	if due {
+		r.lastBatchCommitAt = now
+	}
+	offsets := r.pendingCommits
+	if due {
+		r.pendingCommits = offsetStash{}
+	}
+	r.batchCommitMu.Unlock()
+
+	if !due {
+		return nil
+	}
+	return r.commitStash(ctx, offsets)
+}
+
+// flushPendingBatchCommit sends any offsets coalesced since the last flush.
+// It is invoked when the Reader closes so that fully processed batches are not
+// left uncommitted across the throttle window.
+func (r *Reader) flushPendingBatchCommit(ctx context.Context) error {
+	r.batchCommitMu.Lock()
+	offsets := r.pendingCommits
+	r.pendingCommits = offsetStash{}
+	r.lastBatchCommitAt = time.Now()
+	r.batchCommitMu.Unlock()
+
+	if len(offsets) == 0 {
+		return nil
+	}
+	return r.commitStash(ctx, offsets)
+}
+
+// commitStash publishes a snapshot of coalesced offsets through the standard
+// commit pipeline. With synchronous commits (CommitInterval == 0) it blocks
+// until the broker acknowledges; with asynchronous commits it is queued and
+// applied by the background commit loop.
+func (r *Reader) commitStash(ctx context.Context, offsets offsetStash) error {
+	var commits []commit
+	for topic, partitions := range offsets {
+		for partition, offset := range partitions {
+			commits = append(commits, commit{
+				topic:     topic,
+				partition: partition,
+				offset:    offset,
+			})
+		}
+	}
+
+	creq := commitRequest{commits: commits}
+	var errch <-chan error
+	if r.useSyncCommits() {
+		ch := make(chan error, 1)
+		errch, creq.errch = ch, ch
+	}
+
+	select {
+	case r.commits <- creq:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-r.stctx.Done():
 		return io.ErrClosedPipe
 	}
 

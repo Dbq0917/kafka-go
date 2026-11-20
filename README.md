@@ -305,6 +305,33 @@ partition were retrieved by call to `FetchMessage`, calling `CommitMessages`
 with message offset 3 will also result in committing the messages at offsets 1
 and 2 for that partition.
 
+### Batched At-Least-Once Consumption
+
+`ReadMessage` commits a message before the application has processed it, so a
+crash between the commit and the processing step can silently drop messages.
+`ReadMessageBatch` enforces the opposite ordering: it fetches a batch, hands it
+to the handler, and commits the offsets only when the handler returns `nil`.
+
+* A failed handler means **no commit**. The whole batch stays uncommitted and is
+  redelivered from the last committed offset, so processing must be idempotent.
+* Successful batches are coalesced and flushed at most once per second (plus a
+  final flush on `Close`), keeping the commit frequency independent of the batch
+  rate. Duplicate or retried commits never move a committed offset backwards.
+
+```go
+const batchSize = 500
+
+for {
+    err := r.ReadMessageBatch(ctx, batchSize, func(ctx context.Context, msgs []kafka.Message) error {
+        // Process the whole batch here. Returning an error redelivers it.
+        return process(ctx, msgs)
+    })
+    if err != nil {
+        log.Fatal("consume batch:", err)
+    }
+}
+```
+
 ### Managing Commits
 
 By default, CommitMessages will synchronously commit offsets to Kafka.  For
