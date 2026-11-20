@@ -21,6 +21,7 @@ import (
 	"github.com/segmentio/kafka-go/protocol/createtopics"
 	"github.com/segmentio/kafka-go/protocol/findcoordinator"
 	meta "github.com/segmentio/kafka-go/protocol/metadata"
+	produceAPI "github.com/segmentio/kafka-go/protocol/produce"
 	"github.com/segmentio/kafka-go/protocol/saslauthenticate"
 	"github.com/segmentio/kafka-go/protocol/saslhandshake"
 	"github.com/segmentio/kafka-go/sasl"
@@ -77,6 +78,11 @@ type Transport struct {
 	// configured here is an upper bound, the transport randomizes the TTLs to
 	// avoid getting into states where multiple clients end up synchronized and
 	// cause bursts of requests to the kafka broker.
+	//
+	// The TTL is only a fallback mechanism: the transport also refreshes its
+	// metadata when requests fail in ways that indicate that the cached
+	// cluster layout may have become stale (e.g. after a partition leader
+	// election).
 	//
 	// Default to 6s.
 	MetadataTTL time.Duration
@@ -301,6 +307,10 @@ type connPool struct {
 	conns map[int32]*connGroup // data connections used for produce/fetch/etc...
 	ctrl  *connGroup           // control connections used for metadata requests
 	state atomic.Value         // cached cluster state
+	// Timestamp of the last metadata refresh that was requested after a
+	// request failure, used to debounce refresh requests so bursts of
+	// failures don't turn into bursts of metadata requests.
+	lastWake int64
 }
 
 type connPoolState struct {
@@ -398,10 +408,35 @@ func (p *connPool) roundTrip(ctx context.Context, req Request) (Response, error)
 
 	r, err := response.await(ctx)
 	if err != nil {
+		// Requests routed to a specific broker may fail because the cached
+		// cluster layout is stale: after a partition leader election, the
+		// previous leader often becomes unreachable and the request times
+		// out instead of returning a redirection. Schedule an asynchronous
+		// metadata refresh so the next attempts are routed with an up-to-date
+		// view of the cluster. Explicit cancellations from the caller are
+		// not a signal of stale metadata.
+		if _, ok := req.(protocol.BrokerMessage); ok && !errors.Is(err, context.Canceled) {
+			p.wakeUp()
+		}
 		return r, err
 	}
 
 	switch resp := r.(type) {
+	case *produceAPI.Response:
+		// The broker is alive but rejected the write because it is not (or
+		// no longer) the leader for one of the partitions, which indicates
+		// that the cached cluster layout is stale. Schedule an asynchronous
+		// metadata refresh so subsequent writes are routed to the current
+		// partition leaders.
+		for i := range resp.Topics {
+			partitions := resp.Topics[i].Partitions
+			for j := range partitions {
+				switch Error(partitions[j].ErrorCode) {
+				case NotLeaderForPartition, LeaderNotAvailable, ReplicaNotAvailable:
+					p.wakeUp()
+				}
+			}
+		}
 	case *createtopics.Response:
 		// Force an update of the metadata when adding topics,
 		// otherwise the cached state would get out of sync.
@@ -495,6 +530,37 @@ func (p *connPool) refreshMetadata(ctx context.Context, expectTopics []string) {
 
 func (p *connPool) setReady() {
 	p.once.Do(p.ready.trigger)
+}
+
+// minMetadataRefreshInterval is the minimum delay between two metadata
+// refreshes triggered by request failures. It debounces failure storms (e.g.
+// while a leader election is in progress) so every failed write doesn't turn
+// into a metadata request, while still letting the transport detect topology
+// changes much faster than the metadata TTL would.
+const minMetadataRefreshInterval = time.Second
+
+// wakeUp requests an asynchronous refresh of the cached cluster metadata.
+//
+// The method never blocks and never adds latency to the request path: if a
+// refresh was recently requested, or the goroutine that refreshes metadata
+// is already busy, the request is dropped because an up-to-date view of the
+// cluster is already on its way.
+func (p *connPool) wakeUp() {
+	now := time.Now().UnixNano()
+	last := atomic.LoadInt64(&p.lastWake)
+
+	if (now - last) < int64(minMetadataRefreshInterval) {
+		return
+	}
+
+	if !atomic.CompareAndSwapInt64(&p.lastWake, last, now) {
+		return
+	}
+
+	select {
+	case p.wake <- nil:
+	default:
+	}
 }
 
 // update is called periodically by the goroutine running the discover method
